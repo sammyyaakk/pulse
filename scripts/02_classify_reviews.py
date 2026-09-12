@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from groq import AsyncGroq, RateLimitError
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_not_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
@@ -163,7 +163,7 @@ def log_failure(review_id: str, text: str, reason: str) -> None:
     reraise=True,
     stop=stop_after_attempt(4),
     wait=wait_exponential(multiplier=1, min=2, max=30),
-    retry=retry_if_exception_type(Exception),
+    retry=retry_if_not_exception_type(RateLimitError),
 )
 async def _call_groq(client: AsyncGroq, model: str, review_text: str) -> dict:
     resp = await client.chat.completions.create(
@@ -183,7 +183,7 @@ async def _call_groq(client: AsyncGroq, model: str, review_text: str) -> dict:
     reraise=True,
     stop=stop_after_attempt(4),
     wait=wait_exponential(multiplier=1, min=2, max=30),
-    retry=retry_if_exception_type(Exception),
+    retry=retry_if_not_exception_type(RateLimitError),
 )
 async def _call_groq_batch(client: AsyncGroq, model: str, payload: list[dict]) -> dict:
     resp = await client.chat.completions.create(
