@@ -1,12 +1,3 @@
-"""Phase 3 — aggregate classified reviews into dashboard-ready flat tables.
-
-Joins the raw reviews CSV to the classifications SQLite table, then writes
-four flat CSVs to `exports/`, each shaped for a single Power BI / Tableau view.
-
-Run:
-    python scripts/03_aggregate.py
-"""
-
 from __future__ import annotations
 
 import logging
@@ -17,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config import (  # noqa: E402
+from config import (
     CLASSIFIED_DB,
     EXPORTS_DIR,
     RAW_REVIEWS_CSV,
@@ -31,9 +22,9 @@ log = logging.getLogger("aggregate")
 
 def load_joined() -> pd.DataFrame:
     if not RAW_REVIEWS_CSV.exists():
-        raise SystemExit(f"missing {RAW_REVIEWS_CSV} — run Phase 1 first")
+        raise SystemExit(f"missing {RAW_REVIEWS_CSV} - run Phase 1 first")
     if not CLASSIFIED_DB.exists():
-        raise SystemExit(f"missing {CLASSIFIED_DB} — run Phase 2 first")
+        raise SystemExit(f"missing {CLASSIFIED_DB} - run Phase 2 first")
 
     raw = pd.read_csv(RAW_REVIEWS_CSV, parse_dates=["date"])
     with sqlite3.connect(CLASSIFIED_DB) as conn:
@@ -49,7 +40,6 @@ def load_joined() -> pd.DataFrame:
 
 
 def monthly_volume(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per (month, category). Missing combos filled with 0."""
     months = pd.date_range(df["month"].min(), df["month"].max(), freq="MS")
     idx = pd.MultiIndex.from_product([months, TAXONOMY], names=["month", "category"])
     out = (
@@ -62,7 +52,6 @@ def monthly_volume(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def low_star_share(df: pd.DataFrame) -> pd.DataFrame:
-    """Each category's share of all 1-2 star reviews."""
     low = df[df["is_low_star"]]
     total = len(low)
     counts = low.groupby("category").size().reindex(TAXONOMY, fill_value=0)
@@ -72,7 +61,6 @@ def low_star_share(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def severity_weighted(df: pd.DataFrame) -> pd.DataFrame:
-    """avg severity * volume per theme — the ranking metric for the memo."""
     grouped = df.groupby("category").agg(
         review_count=("severity", "size"),
         avg_severity=("severity", "mean"),
@@ -85,7 +73,6 @@ def severity_weighted(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def rating_distribution(df: pd.DataFrame) -> pd.DataFrame:
-    """category x star -> count, tall format (one row per (category, star))."""
     stars = [1, 2, 3, 4, 5]
     idx = pd.MultiIndex.from_product([TAXONOMY, stars], names=["category", "rating"])
     out = (
@@ -112,12 +99,10 @@ def main() -> None:
         table.to_csv(path, index=False, encoding="utf-8")
         log.info("wrote %s (%d rows)", path, len(table))
 
-    # Bundle everything into one xlsx for the resume-viewer who wants to poke
-    # without importing four CSVs by hand.
     xlsx_path = EXPORTS_DIR / "pulse_dashboard_tables.xlsx"
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         for name, table in outputs.items():
-            sheet = name.replace(".csv", "")[:31]  # Excel sheet name cap
+            sheet = name.replace(".csv", "")[:31]
             table.to_excel(writer, sheet_name=sheet, index=False)
     log.info("wrote %s", xlsx_path)
 

@@ -1,20 +1,3 @@
-"""Phase 2 — classify each review into the fixed taxonomy via Groq.
-
-- Reads raw reviews from `data/raw_reviews.csv`.
-- Writes classifications to a SQLite table in `data/classified_reviews.db`
-  after every batch so a rate-limit error or crash never loses completed work.
-- Falls back from the 70B model to the 8B model on rate-limit errors.
-- Retries transient errors with exponential backoff.
-- Any review that fails after retries is logged to `logs/classify_failures.jsonl`.
-
-Run:
-    # Small-sample smoke test first (recommended before the full run):
-    python scripts/02_classify_reviews.py --limit 20
-
-    # Full run:
-    python scripts/02_classify_reviews.py
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -23,7 +6,6 @@ import logging
 import os
 import sqlite3
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -39,7 +21,7 @@ from tenacity import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config import (  # noqa: E402
+from config import (
     BATCH_SIZE,
     CLASSIFIED_DB,
     CLASSIFY_FAILURES_LOG,
@@ -125,11 +107,6 @@ def log_failure(review_id: str, text: str, reason: str) -> None:
         f.write(json.dumps({"review_id": review_id, "text": text, "reason": reason}) + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Groq call — one review at a time so a single bad row cannot poison a batch,
-# and so JSON parsing stays trivial. Batching still happens at the DB-write
-# level, which is where "don't lose work on a crash" actually matters.
-# ---------------------------------------------------------------------------
 @retry(
     reraise=True,
     stop=stop_after_attempt(4),
@@ -143,7 +120,7 @@ def _call_groq(client: Groq, model: str, review_text: str) -> dict:
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": review_text[:1500]},  # cap absurdly long reviews
+            {"role": "user", "content": review_text[:1500]},
         ],
     )
     content = resp.choices[0].message.content or "{}"
@@ -151,7 +128,6 @@ def _call_groq(client: Groq, model: str, review_text: str) -> dict:
 
 
 def classify_one(client: Groq, review_id: str, text: str) -> Classification | None:
-    """Try primary model, fall back to smaller model on rate-limit."""
     for model in (PRIMARY_MODEL, FALLBACK_MODEL):
         try:
             data = _call_groq(client, model, text)
@@ -180,8 +156,7 @@ def classify_one(client: Groq, review_id: str, text: str) -> Classification | No
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Only classify the first N unclassified reviews (for smoke tests).")
+    parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
     load_dotenv()
@@ -191,7 +166,7 @@ def main() -> None:
         sys.exit(1)
 
     if not RAW_REVIEWS_CSV.exists():
-        log.error("missing %s — run scripts/01_scrape_reviews.py first", RAW_REVIEWS_CSV)
+        log.error("missing %s - run scripts/01_scrape_reviews.py first", RAW_REVIEWS_CSV)
         sys.exit(1)
 
     df = pd.read_csv(RAW_REVIEWS_CSV)
@@ -219,13 +194,13 @@ def main() -> None:
 
         if len(buffer) >= BATCH_SIZE:
             save_batch(conn, buffer)
-            log.info("wrote batch — %d processed / %d remaining, %d in this run's failures.jsonl",
+            log.info("wrote batch - %d processed / %d remaining, %d in this run's failures.jsonl",
                      processed, len(remaining) - processed, _count_failures())
             buffer.clear()
 
     if buffer:
         save_batch(conn, buffer)
-        log.info("wrote final batch — %d processed total", processed)
+        log.info("wrote final batch - %d processed total", processed)
 
     conn.close()
 

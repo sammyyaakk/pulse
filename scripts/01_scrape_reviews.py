@@ -1,21 +1,3 @@
-"""Phase 1 — pull Play Store reviews for the target app.
-
-Two-step approach:
-  1. Scrape as many reviews as Play Store will serve (up to SCRAPE_TARGET),
-     newest-first. Write the FULL pull to `data/raw_reviews_full.csv` — this is
-     the immutable checkpoint. Later phases do not re-scrape.
-  2. Downsample uniformly at random to CLASSIFY_TARGET rows and write to
-     `data/raw_reviews.csv`. Uniform-random preserves the true per-day volume
-     distribution, so the resulting trend lines aren't fake.
-
-Why the split: Play Store paginates newest-first with no date filter and hits
-throughput of ~300-1,700 reviews/day depending on app. To span months instead
-of days at a 5k classification budget, we have to scrape wide and sample.
-
-Run:
-    python scripts/01_scrape_reviews.py
-"""
-
 from __future__ import annotations
 
 import logging
@@ -28,7 +10,7 @@ import pandas as pd
 from google_play_scraper import Sort, reviews
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config import (  # noqa: E402
+from config import (
     APP_COUNTRY,
     APP_LANG,
     APP_NAME,
@@ -136,9 +118,8 @@ def scrape() -> pd.DataFrame:
 
 
 def downsample(df: pd.DataFrame, target: int) -> pd.DataFrame:
-    """Uniform-random sample. Preserves per-day density → trend lines stay honest."""
     if len(df) <= target:
-        log.info("scraped only %d — using full set (no downsample needed)", len(df))
+        log.info("scraped only %d - using full set (no downsample needed)", len(df))
         return df.copy()
     return df.sample(n=target, random_state=DOWNSAMPLE_SEED).sort_values("date").reset_index(drop=True)
 
@@ -148,7 +129,7 @@ def _describe(df: pd.DataFrame, label: str) -> None:
         log.info("%s: EMPTY", label)
         return
     dates = pd.to_datetime(df["date"])
-    log.info("%s: %d rows, %s → %s (%d days)",
+    log.info("%s: %d rows, %s -> %s (%d days)",
              label, len(df), dates.min().date(), dates.max().date(),
              (dates.max() - dates.min()).days)
 
