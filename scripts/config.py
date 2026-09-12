@@ -38,3 +38,4 @@ TAXONOMY = [
 PRIMARY_MODEL = "openai/gpt-oss-20b"
 FALLBACK_MODEL = "qwen/qwen3.8-27b"
 BATCH_SIZE = 25
+CLASSIFY_BATCH_SIZE = 5
