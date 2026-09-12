@@ -35,8 +35,13 @@ TAXONOMY = [
     "Other / positive",
 ]
 
-PRIMARY_MODEL = "openai/gpt-oss-20b"
-FALLBACK_MODEL = "qwen/qwen3.8-27b"
+MODEL_CHAIN: list[tuple[str, str]] = [
+    ("openai/gpt-oss-20b", "qwen/qwen3.8-27b"),
+    ("openai/gpt-oss-safeguard-20b", "openai/gpt-oss-20b"),
+    ("openai/gpt-oss-120b", "groq/compound-mini"),
+    ("qwen/qwen3.8-27b", "qwen/qwen3.6-27b"),
+]
+
 BATCH_SIZE = 25
 CLASSIFY_BATCH_SIZE = 5
 CLASSIFY_CONCURRENCY = 4

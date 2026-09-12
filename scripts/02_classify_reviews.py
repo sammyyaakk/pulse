@@ -29,12 +29,42 @@ from config import (
     CLASSIFY_CONCURRENCY,
     CLASSIFY_FAILURES_LOG,
     DATA_DIR,
-    FALLBACK_MODEL,
     LOGS_DIR,
-    PRIMARY_MODEL,
+    MODEL_CHAIN,
     RAW_REVIEWS_CSV,
     TAXONOMY,
 )
+
+
+class _ChainState:
+    """Tracks which (primary, fallback) pair in MODEL_CHAIN is currently in use.
+
+    Shared across concurrent workers. `advance_from(idx)` is idempotent — if
+    two workers both hit exhaustion on the same pair, only one advance takes
+    effect. Safe under asyncio because index reads/writes never straddle an
+    await.
+    """
+
+    def __init__(self) -> None:
+        self.index = 0
+
+    def current(self) -> tuple[str, str] | None:
+        if self.index >= len(MODEL_CHAIN):
+            return None
+        return MODEL_CHAIN[self.index]
+
+    def advance_from(self, from_index: int) -> None:
+        if self.index == from_index and self.index < len(MODEL_CHAIN):
+            self.index += 1
+            new = self.current()
+            if new is not None:
+                log.warning("chain: advancing to pair %d = %s / %s",
+                            self.index, new[0], new[1])
+            else:
+                log.warning("chain: exhausted after %d pairs", self.index)
+
+
+chain_state = _ChainState()
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -183,88 +213,151 @@ def _parse_one_result(item: dict, review_id: str, text: str, model: str) -> Clas
     return Classification(review_id, category, severity, justification, model)
 
 
-async def classify_one(client: AsyncGroq, review_id: str, text: str) -> Classification | None:
-    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+async def _try_pair_one(client: AsyncGroq,
+                        primary: str,
+                        fallback: str,
+                        review_id: str,
+                        text: str) -> tuple[Classification | None, bool, bool]:
+    """One review through one chain pair.
+
+    Returns (result, both_rate_limited, gave_up_on_review):
+      - result != None: success
+      - both_rate_limited=True: signal to advance the chain
+      - gave_up_on_review=True: per-review failure, already logged, don't advance
+    """
+    both_rate_limited = True
+    for model in (primary, fallback):
         try:
             data = await _call_groq(client, model, text)
         except RateLimitError as exc:
-            log.warning("rate limit on %s (%s); trying fallback", model, exc)
+            log.warning("rate limit on %s (%s); trying next", model, exc)
             continue
         except Exception as exc:
             log_failure(review_id, text, f"{type(exc).__name__}: {exc}")
-            return None
+            return None, False, True
+        both_rate_limited = False
         result = _parse_one_result(data, review_id, text, model)
+        return result, False, result is None
+    return None, both_rate_limited, False
+
+
+async def classify_one(client: AsyncGroq, review_id: str, text: str) -> Classification | None:
+    for _ in range(len(MODEL_CHAIN) + 1):
+        idx = chain_state.index
+        pair = chain_state.current()
+        if pair is None:
+            break
+        primary, fallback = pair
+        result, rate_limited_both, gave_up = await _try_pair_one(
+            client, primary, fallback, review_id, text
+        )
         if result is not None:
             return result
+        if gave_up:
+            return None
+        if rate_limited_both:
+            chain_state.advance_from(idx)
+            continue
         return None
 
-    log_failure(review_id, text, "rate-limited on both primary and fallback")
+    log_failure(review_id, text, "model chain exhausted")
     return None
 
 
-async def classify_batch(client: AsyncGroq,
-                         reviews_batch: list[tuple[str, str]]) -> list[Classification]:
-    """Classify a batch of reviews in a single API call.
+async def _try_pair_batch(client: AsyncGroq,
+                          primary: str,
+                          fallback: str,
+                          reviews_batch: list[tuple[str, str]]
+                          ) -> tuple[list[Classification], bool, bool]:
+    """One batch through one chain pair.
 
-    Falls back to per-review classify_one() calls if the batch response is
-    malformed or under-sized, so quality never regresses relative to the
-    sequential path.
+    Returns (results, both_rate_limited, malformed):
+      - results with items: partial or full success (missing ids handled by caller)
+      - both_rate_limited=True: advance the chain
+      - malformed=True: caller should fall back to sequential (per-review) path
+                       without advancing (the batch prompt shape may just be
+                       tripping this model)
     """
-    if not reviews_batch:
-        return []
-
     payload = [{"id": i, "text": text[:1500]} for i, (_, text) in enumerate(reviews_batch)]
+    both_rate_limited = True
 
-    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+    for model in (primary, fallback):
         try:
             data = await _call_groq_batch(client, model, payload)
         except RateLimitError as exc:
-            log.warning("batch rate limit on %s (%s); trying fallback", model, exc)
+            log.warning("batch rate limit on %s (%s); trying next", model, exc)
             continue
         except Exception as exc:
-            log.warning("batch call raised %s on %s; falling back to per-review",
+            log.warning("batch call raised %s on %s; will fall back to sequential",
                         type(exc).__name__, model)
-            return await _classify_batch_sequentially(client, reviews_batch)
+            return [], False, True
 
+        both_rate_limited = False
         results = data.get("results")
         if not isinstance(results, list) or len(results) < len(reviews_batch):
-            log.warning("batch under-returned (%d of %d) on %s; falling back to per-review",
-                        len(results) if isinstance(results, list) else 0, len(reviews_batch), model)
-            return await _classify_batch_sequentially(client, reviews_batch)
+            log.warning("batch under-returned (%d of %d) on %s; will fall back to sequential",
+                        len(results) if isinstance(results, list) else 0,
+                        len(reviews_batch), model)
+            return [], False, True
 
-        by_id = {}
+        by_id: dict[int, dict] = {}
         for item in results:
             if not isinstance(item, dict):
                 continue
             try:
-                idx = int(item.get("id"))
+                iid = int(item.get("id"))
             except (TypeError, ValueError):
                 continue
-            if 0 <= idx < len(reviews_batch):
-                by_id[idx] = item
+            if 0 <= iid < len(reviews_batch):
+                by_id[iid] = item
 
         out: list[Classification] = []
-        missing = 0
         for idx, (rid, text) in enumerate(reviews_batch):
             item = by_id.get(idx)
             if item is None:
-                missing += 1
                 continue
             parsed = _parse_one_result(item, rid, text, model)
             if parsed is not None:
                 out.append(parsed)
 
+        classified = {c.review_id for c in out}
+        missing = [(rid, text) for rid, text in reviews_batch if rid not in classified]
         if missing:
-            log.warning("batch had %d missing ids; falling back to per-review for those",
-                        missing)
-            missing_reviews = [(rid, text) for idx, (rid, text) in enumerate(reviews_batch)
-                               if idx not in by_id]
-            out.extend(await _classify_batch_sequentially(client, missing_reviews))
+            log.warning("batch missed %d ids on %s; retrying those sequentially",
+                        len(missing), model)
+            out.extend(await _classify_batch_sequentially(client, missing))
 
-        return out
+        return out, False, False
+
+    return [], both_rate_limited, False
+
+
+async def classify_batch(client: AsyncGroq,
+                         reviews_batch: list[tuple[str, str]]) -> list[Classification]:
+    """Classify a batch of reviews, walking MODEL_CHAIN as pairs get exhausted."""
+    if not reviews_batch:
+        return []
+
+    for _ in range(len(MODEL_CHAIN) + 1):
+        idx = chain_state.index
+        pair = chain_state.current()
+        if pair is None:
+            break
+        primary, fallback = pair
+        results, rate_limited_both, malformed = await _try_pair_batch(
+            client, primary, fallback, reviews_batch
+        )
+        if results:
+            return results
+        if malformed:
+            return await _classify_batch_sequentially(client, reviews_batch)
+        if rate_limited_both:
+            chain_state.advance_from(idx)
+            continue
+        break
 
     for rid, text in reviews_batch:
-        log_failure(rid, text, "rate-limited on both primary and fallback (batch)")
+        log_failure(rid, text, "model chain exhausted (batch)")
     return []
 
 
