@@ -4,3 +4,6 @@ pandas>=2.2.0
 python-dotenv>=1.0.1
 tenacity>=8.5.0
 openpyxl>=3.1.2
+
+# dev-only
+pytest>=8.0.0
