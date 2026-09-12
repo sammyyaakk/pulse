@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,28 +14,40 @@ WINDOW_MIN = 10
 RATE_ALERT_BELOW = 8
 FAILURE_ALERT_ABOVE = 10
 
-STATE_FILE = Path(__file__).resolve().parent.parent / "logs" / "check_state.json"
 
-
-def load_prev_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-
-def save_state(state: dict) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
-
-
-def failure_count() -> int:
+def total_failure_count() -> int:
     if not CLASSIFY_FAILURES_LOG.exists():
         return 0
     with open(CLASSIFY_FAILURES_LOG, "r", encoding="utf-8") as f:
         return sum(1 for _ in f)
+
+
+def failures_in_window(now: datetime, minutes: int) -> int:
+    """Count failure log entries with logged_at within the last `minutes` minutes.
+
+    Entries without a logged_at field (from before the timestamped-log
+    change) are ignored — they can't be placed on the timeline.
+    """
+    if not CLASSIFY_FAILURES_LOG.exists():
+        return 0
+    cutoff = now - timedelta(minutes=minutes)
+    count = 0
+    with open(CLASSIFY_FAILURES_LOG, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = entry.get("logged_at")
+            if not ts:
+                continue
+            try:
+                logged = datetime.fromisoformat(ts).replace(tzinfo=None)
+            except ValueError:
+                continue
+            if logged >= cutoff:
+                count += 1
+    return count
 
 
 def main() -> None:
@@ -61,25 +71,13 @@ def main() -> None:
     for (m,) in recent_rows:
         by_model_recent[m] = by_model_recent.get(m, 0) + 1
 
-    now_fails = failure_count()
-    prev = load_prev_state()
-    prev_fails = int(prev.get("failure_count", 0))
-    prev_ts = prev.get("checked_at")
-    fail_delta = now_fails - prev_fails
-
-    if prev_ts:
-        try:
-            gap_min = max((now - datetime.fromisoformat(prev_ts)).total_seconds() / 60, 1e-6)
-        except Exception:
-            gap_min = None
-    else:
-        gap_min = None
+    fails_total = total_failure_count()
+    fails_recent = failures_in_window(now, WINDOW_MIN)
 
     print(f"SUMMARY: {total}/{TOTAL_TARGET} ({total/TOTAL_TARGET:.1%}) | "
           f"rate {rate_per_min:.1f}/min (last {WINDOW_MIN}m, {len(recent_rows)} rows) | "
           f"ETA {eta_min:.0f} min" + (f" ({eta_min/60:.1f} h)" if eta_min != float('inf') else "") +
-          f" | failures {now_fails} (+{fail_delta} since last check" +
-          (f" ~{gap_min:.0f}m ago" if gap_min else "") + ")")
+          f" | failures {fails_total} total, {fails_recent} in last {WINDOW_MIN}m")
 
     if by_model_recent:
         print(f"models (last {WINDOW_MIN}m): {by_model_recent}")
@@ -93,15 +91,13 @@ def main() -> None:
         alerts.append(
             f"ALERT: rate {rate_per_min:.1f}/min is below threshold {RATE_ALERT_BELOW}/min"
         )
-    if fail_delta > FAILURE_ALERT_ABOVE:
+    if fails_recent > FAILURE_ALERT_ABOVE:
         alerts.append(
-            f"ALERT: {fail_delta} new failures since last check "
+            f"ALERT: {fails_recent} failures in last {WINDOW_MIN}m "
             f"(threshold >{FAILURE_ALERT_ABOVE})"
         )
     for a in alerts:
         print(a)
-
-    save_state({"failure_count": now_fails, "checked_at": now.isoformat()})
 
 
 if __name__ == "__main__":
