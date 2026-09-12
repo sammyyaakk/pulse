@@ -8,6 +8,7 @@ import os
 import sqlite3
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -155,8 +156,14 @@ def save_batch(conn: sqlite3.Connection, rows: Iterable[Classification]) -> None
 
 
 def log_failure(review_id: str, text: str, reason: str) -> None:
+    entry = {
+        "logged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "review_id": review_id,
+        "text": text,
+        "reason": reason,
+    }
     with open(CLASSIFY_FAILURES_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"review_id": review_id, "text": text, "reason": reason}) + "\n")
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 @retry(
