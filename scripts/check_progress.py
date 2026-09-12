@@ -1,18 +1,3 @@
-"""Standalone progress check for the Phase 2 classifier.
-
-Fixes an earlier bug: the previous check anchored its 10-minute window on the
-last-written row, so batch writes (25 rows landing within ~1 second) always
-looked like "1,500 reviews/minute" and masked real stalls. This version
-anchors the window on wall-clock now, so a stalled classifier reports a
-low rate even if its last write was recent.
-
-Prints a one-line SUMMARY and, if any threshold trips, one or more ALERT lines.
-
-Thresholds:
-    rate below 8/min over last 10 min  -> ALERT
-    failures growing by 10+ in last 10 min  -> ALERT
-"""
-
 from __future__ import annotations
 
 import json
@@ -24,15 +9,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config import CLASSIFIED_DB, CLASSIFY_FAILURES_LOG  # noqa: E402
+from config import CLASSIFIED_DB, CLASSIFY_FAILURES_LOG
 
 TOTAL_TARGET = 5000
 WINDOW_MIN = 10
-RATE_ALERT_BELOW = 8         # reviews/min
-FAILURE_ALERT_ABOVE = 10     # failures newly logged inside the window
+RATE_ALERT_BELOW = 8
+FAILURE_ALERT_ABOVE = 10
 
-# Cache the failure-log line-count between runs so we can detect deltas even
-# though individual entries don't carry timestamps.
 STATE_FILE = Path(__file__).resolve().parent.parent / "logs" / "check_state.json"
 
 
@@ -58,7 +41,7 @@ def failure_count() -> int:
 
 
 def main() -> None:
-    now = datetime.now(timezone.utc).replace(tzinfo=None)  # SQLite CURRENT_TIMESTAMP is naive UTC
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     cutoff = now - timedelta(minutes=WINDOW_MIN)
 
     with sqlite3.connect(CLASSIFIED_DB) as conn:
@@ -70,8 +53,6 @@ def main() -> None:
             (cutoff.isoformat(sep=" ", timespec="seconds"),),
         ).fetchall()
 
-    # wall-clock-anchored rate: count rows landed in the last WINDOW_MIN minutes,
-    # divide by WINDOW_MIN. NOT by (last - first) inside the window.
     rate_per_min = len(recent_rows) / WINDOW_MIN
     remaining = TOTAL_TARGET - total
     eta_min = remaining / rate_per_min if rate_per_min > 0 else float("inf")
@@ -86,7 +67,6 @@ def main() -> None:
     prev_ts = prev.get("checked_at")
     fail_delta = now_fails - prev_fails
 
-    # How long since last check — used to normalize the failure delta.
     if prev_ts:
         try:
             gap_min = max((now - datetime.fromisoformat(prev_ts)).total_seconds() / 60, 1e-6)
@@ -113,7 +93,6 @@ def main() -> None:
         alerts.append(
             f"ALERT: rate {rate_per_min:.1f}/min is below threshold {RATE_ALERT_BELOW}/min"
         )
-    # Only alert on failure growth measured in a comparable window
     if fail_delta > FAILURE_ALERT_ABOVE:
         alerts.append(
             f"ALERT: {fail_delta} new failures since last check "
