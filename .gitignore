@@ -1,0 +1,24 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# Local tooling / IDE state
+.claude/
+
+# Original starting-prompt doc — kept locally, not part of the repo
+claude-code-brief.md
+
+# Large intermediate outputs — keep the schema in git via README, not the files
+data/*.csv
+data/*.db
+data/*.xlsx
+logs/*.log
+logs/*.jsonl
+logs/*.json
+exports/*.csv
+exports/*.xlsx
