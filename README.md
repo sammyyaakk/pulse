@@ -1,12 +1,14 @@
 # Pulse — Review Mining for Quick-Commerce Churn Root-Cause Analysis
 
-Pulse pulls Play Store reviews for Swiggy (which includes Instamart, its quick-commerce arm), classifies each into a fixed complaint taxonomy using Groq's Llama models, and rolls the results up into dashboard-ready tables plus a per-theme revenue-at-risk estimate.
+Pulse pulls Play Store reviews for Swiggy (Instamart is inside the same app), classifies each one into a fixed complaint taxonomy using Groq's hosted models, and rolls the results up into dashboard-ready tables plus a per-theme revenue-at-risk estimate.
 
-## App choice
+**The question I wanted to answer:** which operational issues actually drive negative reviews on a quick-commerce app, and how much revenue is at risk from each one if it doesn't get fixed?
 
-Original scope named Blinkit. Switched to Swiggy after empirical probing showed Blinkit gets ~900 Play Store reviews/day, meaning 5k reviews cover only ~5 days — too narrow for the trend analysis in the deliverable. Swiggy's rate is ~335/day, so 5k reviews naturally cover ~2 weeks, and scraping wide (~30-40k) covers ~3 months. This is documented so the app swap is defensible in an interview.
+## Why Swiggy and not Blinkit
 
-**Business question:** *Which operational issues drive negative reviews of a quick-commerce app, and how much revenue is at risk from each if left unaddressed?*
+The original scope named Blinkit. I switched after a quick probe: Blinkit gets around 900 Play Store reviews a day, which means a 5,000-review budget covers about five days. That's too narrow for any trend analysis, and Play Store's newest-first pagination doesn't give you a way around it — you scrape recent reviews or nothing.
+
+Swiggy's review rate is closer to 335/day. A 5,000-review sample naturally spans ~2 weeks; if I scrape wide (~30-40k) and downsample, I can cover roughly three months, which is enough for the analysis to say something real. The full write-up on this decision (and everything else that went sideways) is in [LESSONS_LEARNED.md](LESSONS_LEARNED.md).
 
 ---
 
@@ -14,14 +16,14 @@ Original scope named Blinkit. Switched to Swiggy after empirical probing showed 
 
 | Phase | Script | Output |
 |---|---|---|
-| 1. Scrape | `scripts/01_scrape_reviews.py` | `data/raw_reviews_full.csv` (full pull, immutable) + `data/raw_reviews.csv` (5k downsampled slice fed to Phase 2) |
+| 1. Scrape | `scripts/01_scrape_reviews.py` | `data/raw_reviews_full.csv` (the full 40k pull, immutable) and `data/raw_reviews.csv` (5k downsampled slice, fed to Phase 2) |
 | 2. Classify | `scripts/02_classify_reviews.py` | `data/classified_reviews.db` |
 | 3. Aggregate | `scripts/03_aggregate.py` | `exports/*.csv`, `exports/pulse_dashboard_tables.xlsx` |
 | 4. Revenue-at-risk | `scripts/04_revenue_at_risk.py` | `data/revenue_at_risk.csv` |
 
-Every stage reads from the previous stage's checkpoint file, so a crash or rate limit never costs more than one batch.
+Each stage reads the previous stage's checkpoint, so a crash or a rate-limit hiccup never costs more than one batch of work.
 
-Phase 1 scrapes up to `SCRAPE_TARGET` reviews newest-first, then uniform-random downsamples to `CLASSIFY_TARGET` rows for classification. Uniform-random preserves the true per-day review density, so the resulting trend charts reflect real volume rather than a flat sampling artefact.
+Phase 1 does two things in sequence: scrape as many reviews as Play Store will serve (up to `SCRAPE_TARGET`), then uniform-random downsample to `CLASSIFY_TARGET` rows for classification. Uniform-random matters because it preserves the true per-day density, so the trend charts reflect real review volume instead of a flat sampling artefact.
 
 ## Setup
 
@@ -35,26 +37,26 @@ pip install -r requirements.txt
 copy .env.example .env           # then fill in GROQ_API_KEY
 ```
 
-Get a free Groq API key at https://console.groq.com/keys.
+Free Groq API key: https://console.groq.com/keys.
 
 ## Running
 
 ```bash
-# Phase 1 — scrape 3-5k Blinkit reviews from the last 18 months.
+# Phase 1: scrape ~40k Swiggy reviews and downsample to 5k.
 python scripts/01_scrape_reviews.py
 
-# Phase 2 — smoke test on 20 reviews first, then run the full classification.
+# Phase 2: run a 20-review smoke test first, then the full classification.
 python scripts/02_classify_reviews.py --limit 20
 python scripts/02_classify_reviews.py
 
-# Phase 3 — build the four flat dashboard tables.
+# Phase 3: build the four flat dashboard tables + xlsx bundle.
 python scripts/03_aggregate.py
 
-# Phase 4 — revenue-at-risk ranking.
+# Phase 4: revenue-at-risk ranking.
 python scripts/04_revenue_at_risk.py
 ```
 
-Phase 2 is idempotent — it skips any `review_id` already in the SQLite table, so if it dies mid-run, just re-run it.
+Phase 2 is idempotent. It skips any `review_id` already in the SQLite table, so if it dies mid-run, just restart it.
 
 ## Taxonomy
 
@@ -69,53 +71,53 @@ Every review is assigned exactly one of:
 7. Product quality
 8. Other / positive
 
-The taxonomy is fixed in `scripts/config.py`. The model is instructed not to invent categories and to default to "Other / positive" when nothing else fits.
+The taxonomy is fixed in `scripts/config.py`. The model is told not to invent categories and to default to "Other / positive" when nothing else fits.
 
 ## Dashboard tables (`exports/`)
 
 - **monthly_theme_volume.csv** — `(month, category, review_count)`. Trend lines.
 - **low_star_theme_share.csv** — each theme's share of 1-2 star reviews.
-- **severity_weighted_score.csv** — `avg_severity * volume` per theme. Ranking metric.
+- **severity_weighted_score.csv** — `avg_severity × volume` per theme. Ranking metric.
 - **rating_distribution_by_theme.csv** — `(category, rating, review_count)`. Distribution charts.
-- **pulse_dashboard_tables.xlsx** — all four as tabs, for one-click Power BI / Tableau import.
+- **pulse_dashboard_tables.xlsx** — all four as tabs, for one-click Power BI or Tableau import.
 
 ## Revenue-at-risk assumptions
 
 ```
 revenue_at_risk_inr =
     (1-star review count for theme)
-    * ASSUMED_CHURN_RATE
-    * ASSUMED_AVG_ORDER_VALUE_INR
-    * ASSUMED_ORDER_FREQUENCY_MULTIPLIER
+  * ASSUMED_CHURN_RATE
+  * ASSUMED_AVG_ORDER_VALUE_INR
+  * ASSUMED_ORDER_FREQUENCY_MULTIPLIER
 ```
 
-Current values (edit at the top of `scripts/04_revenue_at_risk.py`):
+Values live at the top of `scripts/04_revenue_at_risk.py`:
 
 | Constant | Value | Source |
 |---|---|---|
-| `ASSUMED_CHURN_RATE` | 0.40 | Assumption. A 1-star review on a delivery app is a strong dissatisfaction signal; industry rules-of-thumb range 25-60%. |
-| `ASSUMED_AVG_ORDER_VALUE_INR` | ₹600 | Rounded down from Blinkit AOV of ~₹617 reported in Zomato's Q4 FY24 investor deck (quarter ending Mar-2024). |
-| `ASSUMED_ORDER_FREQUENCY_MULTIPLIER` | 24 | Assumption. Assumes an active user places ~2 orders/month and the churn horizon is 12 months → 24 orders forgone per churned user. |
+| `ASSUMED_CHURN_RATE` | 0.40 | Assumption. A 1-star review on a delivery app is a strong dissatisfaction signal. Industry rules of thumb range 25-60%; I picked the middle. |
+| `ASSUMED_AVG_ORDER_VALUE_INR` | ₹600 | Rounded down from Blinkit's ~₹617 AOV reported in Zomato's Q4 FY24 investor deck. Using it as a conservative proxy for Swiggy since no public Swiggy AOV number was sourced. |
+| `ASSUMED_ORDER_FREQUENCY_MULTIPLIER` | 24 | Assumption. ~2 orders/month for an active user over a 12-month churn horizon → 24 forgone orders per churned user. |
 
-The output is a directional ranking of themes by revenue at risk, not an audited GMV forecast. The value of the number is the **relative ordering** it produces, not the absolute rupee figure.
+The output is a directional ranking of themes by revenue at risk, not an audited GMV forecast. What matters is the ordering, not the absolute rupee figure.
 
 ## Recommendation memo
 
-The recommendation memo lives at [`exports/recommendation_memo.md`](exports/recommendation_memo.md). It ranks the top complaint theme, cites the revenue-at-risk figure, and proposes an operational fix.
+The full memo is at [`exports/recommendation_memo.md`](exports/recommendation_memo.md). It picks the top complaint theme, quotes the revenue-at-risk figure, and proposes an operational fix backed by the ranking.
 
-## Retrospective — issues, fixes, and lessons
+## Lessons learned
 
-The full build did not go to plan. Deprecated models, tighter free-tier rate limits than expected, a target app whose review firehose was too big for the requested time window, and a progress-monitoring bug that quietly reported healthy numbers during a stall — all documented, with what we did about them and what a rebuild should do differently, in [`LESSONS_LEARNED.md`](LESSONS_LEARNED.md).
+The build did not go to plan. Deprecated models, tighter free-tier rate limits than I estimated, an app whose review firehose was too big for the requested time window, and a monitoring bug that quietly reported healthy numbers during a stall — the full postmortem, and what I'd do differently on a rebuild, is in [LESSONS_LEARNED.md](LESSONS_LEARNED.md).
 
 ## Results (from the run in this repo)
 
-- **Sample:** 5,000 reviews, 2026-06-14 → 2026-09-10 (87 days), uniform-random downsample of a 40,000-review scrape.
-- **Top theme by revenue-at-risk:** Customer service / refunds — 402 one-star reviews, average severity 4.37 / 5, ≈ ₹23.2 lakh at risk.
-- **Full ranking:** see [`data/revenue_at_risk.csv`](data/revenue_at_risk.csv).
+- **Sample:** 5,000 reviews spanning 2026-06-14 to 2026-09-10 (87 days). Uniform-random downsample of a 40,000-review pull.
+- **Top theme by revenue-at-risk:** Customer service / refunds. 402 one-star reviews, average severity 4.37 / 5, ≈ ₹23.2 lakh at risk.
+- **Full ranking:** [`data/revenue_at_risk.csv`](data/revenue_at_risk.csv).
 
 ## Model provenance (Phase 2)
 
-Groq's free-tier per-model rate limits meant no single model could carry the full 5k. The classifier was rotated across models as buckets throttled; every row records which model classified it in the `model_used` column. Final split:
+Groq's free-tier rate limits are per-model, and no single model was going to carry the full 5k on its own. So the classifier rotated across model families as buckets throttled, and the `model_used` column records which model produced each row. The final split:
 
 | Model | Rows | Share |
 |---|---|---|
@@ -126,21 +128,22 @@ Groq's free-tier per-model rate limits meant no single model could carry the ful
 | qwen/qwen3.6-27b | 95 | 1.9% |
 | groq/compound-mini | 1 | ~0% |
 
-The label schema (`category`, `severity`, `justification`) is identical across all models and validated post-hoc against the fixed taxonomy — any row whose category was not in the taxonomy was rejected and re-classified rather than silently accepted. The mixed-model provenance is a design choice, not a defect: it's what enabled the full 5k to be labeled on the free tier.
+The label schema (`category`, `severity`, `justification`) is identical across all six. Any row whose category wasn't in the taxonomy was rejected and re-classified rather than silently accepted, so the mixed provenance doesn't leak into the analysis. Full write-up of how the rotation actually played out is in the lessons-learned doc.
 
 ## Repo layout
 
 ```
 pulse/
   scripts/
-    config.py                    # taxonomy, paths, model IDs — shared
+    config.py                    # taxonomy, paths, model IDs
     01_scrape_reviews.py
     02_classify_reviews.py
     03_aggregate.py
     04_revenue_at_risk.py
+    check_progress.py            # standalone monitor for the Phase 2 run
   data/                          # CSV / SQLite checkpoints (gitignored)
-  exports/                       # dashboard-ready outputs (gitignored)
-  logs/                          # scrape log + classification failures
+  exports/                       # dashboard tables + memo
+  logs/                          # scrape log, classification failures
   requirements.txt
   .env.example
 ```

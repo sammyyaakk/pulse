@@ -1,179 +1,209 @@
 # Pulse — Lessons Learned
 
-A running log of everything that went wrong while building this project, how we recovered, and — the point of the document — what a rebuild should do differently on day one.
-
-Structured for interview defense: every entry is something the author can talk about honestly ("we hit X, this is what X actually is, this is what I'd do next time"). Nothing is hidden or spun as intentional.
+An honest log of what went sideways while I was building this. I'm keeping it because a project without a postmortem is just a demo. I'd rather be able to talk about the mistakes in an interview than pretend the build was smooth.
 
 ---
 
-## 1. The brief's target app couldn't support the brief's time window
+## 1. The brief asked for a time window the target app couldn't fit
 
-**What went wrong.** The brief specified Blinkit, 3,000-5,000 reviews, spanning the last 12-18 months. The first scrape completed in ~6 minutes and returned 5,000 reviews spanning **three days**. Blinkit generates roughly 900 Play Store reviews per day; newest-first pagination hit the 5k budget long before it reached the 18-month cutoff. Twelve months of coverage at 900/day would need ≈328,000 reviews — infeasible on the free tier and beyond Play Store's paginated review depth in most cases.
+I set up the scrape thinking 5,000 reviews would give me the last year and a half. First run finished in six minutes and gave me exactly three days. Blinkit gets somewhere near 900 Play Store reviews a day, and `google-play-scraper` returns them newest-first with no date filter. So the 5k budget was gone before the scraper got anywhere close to the 18-month cutoff.
 
-**How we recovered.** Probed Zomato and Swiggy at 500 reviews each to measure their review firehose:
-- Blinkit: ~900/day → 5k covers ~5.6 days
-- Zomato: ~585/day → ~8.5 days
-- Swiggy: ~335/day → ~14.9 days
+To actually cover 12 months I would have needed ~328,000 reviews, which is beyond what Play Store's continuation token will paginate through in practice.
 
-Even Swiggy couldn't span 12 months at 5k reviews. Solution: **scrape wide, downsample narrow.** Pulled 40,000 Swiggy reviews (covered 87 days), then uniform-random downsampled to 5,000 for classification. Uniform-random preserves per-day density, so the resulting trend charts reflect real review volume rather than a flat sampling artefact.
+I probed Zomato and Swiggy the same way to see if either behaved better:
 
-**What we should have done from the start.**
-- **Probe daily review rate for the target app before committing to a time window.** A 30-second `count=500` call would have shown the mismatch immediately, before writing any pipeline code.
-- **Treat "3,000-5,000 reviews + 12-18 months" as two constraints that can conflict, not one goal.** State the tradeoff explicitly in the scope doc — either can be tightened, but not both without an app that has low daily review volume.
-- **Design for downsampling as a first-class step, not a workaround.** The pipeline benefits from separating "the raw pull" (immutable checkpoint) from "the classification sample" — Phase 1's split into `raw_reviews_full.csv` and `raw_reviews.csv` reflects this.
+| App | Rate (reviews/day) | 5k reviews spans |
+|---|---|---|
+| Blinkit | ~900 | 5.6 days |
+| Zomato | ~585 | 8.5 days |
+| Swiggy | ~335 | 14.9 days |
 
----
+Even Swiggy couldn't do 12 months at 5k. The fix I landed on was "scrape wide, downsample narrow": pull 40,000 Swiggy reviews (which covered 87 days) and uniform-random downsample to 5,000 for classification. Uniform-random matters because it preserves per-day density, so the trend charts reflect the real review volume instead of a flat sampling artefact.
 
-## 2. The brief's model IDs had been deprecated by launch time
+What I'd do next time:
 
-**What went wrong.** The brief specified `llama-3.3-70b-versatile` primary and `llama-3.1-8b-instant` fallback. Every classification call returned HTTP 404 — Groq had deprecated the entire Llama 3.x family well before we ran the pipeline. First 40+ calls burned before we noticed the pattern in the log.
-
-**How we recovered.** Called Groq's `client.models.list()` to see what was currently available and swapped in the OpenAI open-weight models (`gpt-oss-120b` and `gpt-oss-20b`) that supported the same `response_format={"type":"json_object"}` behavior.
-
-**What we should have done from the start.**
-- **Never trust model IDs from a brief without a live probe.** The scaffolding step should include a one-line "does the primary model actually respond?" check that runs before the first real batch.
-- **Store model IDs as config, not as literals scattered through code.** We got this right in `scripts/config.py` — it made every subsequent model rotation a one-line edit.
-- **Log the actual model used per row.** The `model_used` column in the SQLite table saved us later when we needed to audit exactly which model classified what. Design for provenance from the start.
+- Actually check the daily review rate for the app before I write the scraper. A 30-second `count=500` call would have told me this immediately.
+- Treat "5,000 reviews" and "12-18 months" as two constraints that can conflict, not one goal. State the tradeoff up front in scope.
+- Build the "downsample after wide scrape" step as a first-class part of Phase 1, not something I bolted on when the first constraint failed.
 
 ---
 
-## 3. API key placed in the wrong file — and the wrong file wasn't gitignored
+## 2. The models named in the brief had been deprecated by launch time
 
-**What went wrong.** The user pasted the Groq API key into `.env.example` instead of `.env`. Two failures compounded:
+The brief specified `llama-3.3-70b-versatile` and `llama-3.1-8b-instant`. Every call returned HTTP 404 before I figured out that Groq had deprecated the whole Llama 3.x family before this project ran. I burned about 40 real calls and a lot of time watching an unhelpful error log before I noticed the pattern.
 
-1. `.env.example` isn't gitignored — only `.env` is. Had this project been under `git init` with a remote, one push would have leaked the key.
-2. Since the project lives under OneDrive, the file with the key was syncing to Microsoft's cloud during the ~5-minute window it existed on disk. OneDrive's file-version history retains that snapshot for ~30 days on personal accounts.
+Fix was straightforward: `client.models.list()` to see what was actually available, then swap in the OpenAI open-weight family (`gpt-oss-120b` and `gpt-oss-20b`), which supports the same JSON response format.
 
-**How we recovered.** Renamed `.env.example` → `.env`, discussed the exposure honestly (no git history had the key, but OneDrive version history likely did), rotated the key at `console.groq.com/keys` as insurance.
+Takeaways:
 
-**What we should have done from the start.**
-- **Don't ship a `.env.example` at all if the "example" is just `KEY=your_key_here`.** The naming is confusingly close to `.env`; users edit the wrong one. Either put the placeholder in the README and delete the example file, or add `.env.example` to `.gitignore` too.
-- **Never build dev projects with real secrets inside OneDrive / Dropbox / iCloud sync roots.** Move the project out of the sync root (e.g. `C:\dev\`) or exclude it from sync via the client's per-folder exclude list.
-- **`git init` on day one, even for a solo portfolio project.** History is useful and it also gives you a concrete answer to "is this key in a commit?"
-- **Consider a `.env.local` naming convention** (many stacks use this) — clearer distinction from `.env.example` and less accident-prone.
+- Model IDs in a brief are just suggestions. Probe them live before writing code that depends on them. My scaffolding step now includes a "does the primary model actually respond?" ping.
+- Store model IDs in one config file. I got this right by accident, and it saved me a lot of pain later when I ended up cycling through six different models.
+- Record the model that produced each row. The `model_used` column in the SQLite table was originally just diagnostic, but it turned into the single most important design decision in this project. See lesson 4.
 
 ---
 
-## 4. Free-tier rate limits were massively under-estimated
+## 3. I put the API key in the wrong file, and the wrong file wasn't gitignored
 
-**What went wrong.** The initial ETA I quoted was ~60 minutes for the full 5,000-review classification. Reality: the run took a full day plus, spanned six models, and required four full rotation cycles. Every early estimate was wrong by an order of magnitude, and each was based on the smoke-test rate (0.75s/request) rather than the sustained rate that free-tier RPM+TPM limits actually permit.
+I pasted the Groq key into `.env.example` instead of `.env`. Two things compounded:
 
-Sustained observed rates by model on Groq's free tier:
-- `gpt-oss-120b`: 8-17 requests/min
-- `gpt-oss-20b`: 15-28 requests/min
-- Qwen and safeguard variants: similar bands
+1. My `.gitignore` was excluding `.env` but not `.env.example`. If this project had already been initialised as a git repo with a remote, one push would have leaked the key to a public URL.
+2. The project sits inside OneDrive. During the ~5 minutes the misplaced key sat on disk, OneDrive was almost certainly syncing that version to Microsoft's cloud. OneDrive keeps file-version history for around 30 days on personal accounts, so even after I renamed the file, the earlier version isn't easy to wipe.
 
-Beyond RPM, there is also a daily TPD (tokens per day) ceiling per model that only manifests after hours of throughput. When it hits, both the primary and fallback models start returning 429s in tandem — that's the signal that the bucket is truly exhausted, not just throttled per-minute.
+Recovery was fine: rename the file, admit the exposure honestly, rotate the key. Nothing bad actually happened.
 
-**How we recovered.** Rotated across independent per-model rate-limit buckets. Groq caps rate limits *per model*, not per account, so switching between model families gives a fresh bucket. We cycled: gpt-oss-120b → gpt-oss-20b → Qwen 3.8 → Qwen 3.6 → gpt-oss-safeguard-20b → back to gpt-oss-120b as the earlier buckets partially reset. The classifier is idempotent (skips reviews already in the SQLite table on restart), so each rotation was: kill classifier → edit `config.py` → relaunch → resume from where it stopped.
+What I'd change:
 
-**What we should have done from the start.**
-- **Quote sustained rate, not smoke-test rate.** A 20-review smoke test finishes before RPM caps engage. Estimate ETA from `RPM_ceiling * 60 * hours_of_daily_budget`, not from `smoke_seconds / smoke_reviews`.
-- **Design for model rotation from day one.** Instead of hardcoding `PRIMARY_MODEL` and `FALLBACK_MODEL` as two constants, use a *chain* — `MODEL_CHAIN = [(primary, fallback), (primary2, fallback2), …]` — and let the classifier itself advance the pointer when it sees repeated "rate-limited on both" failures over a rolling window. Would have removed the need for manual kill/edit/relaunch cycles.
-- **Batch multiple reviews per prompt.** One API call that classifies 5-10 reviews at once cuts RPM usage 5-10x, at the cost of a stricter JSON output contract and a slightly more brittle parser. Would have finished the whole 5k in a single quota window.
-- **Use async concurrency to sit at the RPM ceiling instead of below it.** A sequential for-loop with `time.sleep(0.5)` between calls stayed below the 30 RPM cap by design. An asyncio semaphore of 20-30 workers would push right up to the ceiling.
-- **Reserve a small budget of paid tier if this had a real deadline.** Groq's dev tier ($5 loads a lot of quota) lifts RPM to 1000+; the whole pipeline would have completed in minutes instead of a day.
+- Don't ship a `.env.example` at all if the "example" is a placeholder. The naming is dangerous — one character difference from `.env`, and people (me) will edit the wrong one. Either put the placeholder in the README and delete the file, or add `.env.example` to `.gitignore` too.
+- Keep dev projects with secrets outside cloud sync roots. OneDrive silently caching a copy of a leaked key is the worst kind of exposure because you can't see it.
+- `git init` on day one, even for a solo project. Not because I'll push it, but because I want an answer to "is this key in my history?" that isn't "let me look through my OneDrive backups."
 
 ---
 
-## 5. Silent fallback masked a real problem
+## 4. I under-estimated Groq's free-tier rate limits by a factor of about twenty
 
-**What went wrong.** The classifier catches `RateLimitError` on the primary model and silently retries on the fallback. That behavior is intended, but the `log.warning` line calling out the fallback got filtered out by the `| grep -v "HTTP Request"` pipe I was using in the terminal, and buried in the sheer volume of the run's log output otherwise. Result: during the "120b run", many rows were actually classified by 20b as silent fallbacks, and I only noticed when the `model_used` column showed a suspicious ratio.
+I quoted the user an ETA of ~60 minutes for the full classification. The actual run took most of a day, spanned six models, and required four full rotations across model families. Every early estimate I gave was wrong by an order of magnitude, and each one was based on a 20-review smoke test where the RPM cap never kicked in.
 
-**How we recovered.** Added the model breakdown to the progress-check script (`by_model` in the last 10-minute window). Made the fallback ratio visible on every check.
+Here's what the sustained rates actually looked like on the free tier:
 
-**What we should have done from the start.**
-- **Report fallback usage in the summary, not just as a debug warning.** A one-line "primary hit rate-limit N times, fallback used M times" per batch write would have surfaced the pattern immediately.
-- **Provenance columns are cheap.** The `model_used` column let us audit the mix retroactively. Also add `attempt_count` and `latency_ms` — those help debug throttling patterns without needing raw log parsing.
+| Model | Sustained (req/min) |
+|---|---|
+| gpt-oss-120b | 8-17 |
+| gpt-oss-20b | 15-28 |
+| qwen 3.8-27b | ~25 |
+| everything else | somewhere in that band |
+
+The nasty part isn't RPM. It's TPD — the daily token cap per model. RPM you notice immediately; TPD only shows up after hours of throughput, and when it hits, the primary and fallback models start 429-ing at the same time. That's the tell that a bucket is truly exhausted and not just throttled per-minute.
+
+The way I actually finished the run was by rotating across models. Groq caps rate limits per-model, not per-account, so switching from `gpt-oss-120b` to `qwen 3.8-27b` gives a fresh bucket for the day. The rotation ended up being:
+
+`gpt-oss-120b → gpt-oss-20b → qwen 3.8-27b + 3.6-27b → gpt-oss-safeguard-20b → back to gpt-oss-120b (partially recovered) → gpt-oss-20b + qwen 3.8-27b (mop-up)`
+
+Because the classifier is idempotent (skips reviews already in the SQLite table), each rotation was just: kill the process, edit `config.py`, restart, resume from wherever it stopped. No lost work per rotation, just a lot of wall clock.
+
+Things I'd do differently on a rebuild:
+
+- Quote sustained rate, not smoke-test rate. RPM caps don't engage in the first 20 requests. Estimate ETA from `RPM_ceiling × 60 × hours_of_daily_budget`, not from `smoke_seconds / smoke_count`.
+- Design for model rotation from day one. Instead of `PRIMARY_MODEL` and `FALLBACK_MODEL` as scalar constants, use a chain — `MODEL_CHAIN = [(primary, fallback), (primary2, fallback2), ...]` — and have the classifier advance the pointer itself when both models in the current pair start 429-ing over a rolling window. Would have removed the manual kill/edit/restart loop entirely.
+- Batch multiple reviews per prompt. One call that classifies 5-10 reviews cuts RPM usage by the same factor. Costs you a stricter JSON contract and a more brittle parser, but on a free tier it's worth it.
+- Use async concurrency to sit at the RPM ceiling instead of under it. My sequential loop with `time.sleep(0.5)` was pacing itself well below the 30 RPM cap by construction. An asyncio semaphore of 20-30 workers would push right up against the ceiling and pull the wall-clock down 3-4x.
+- If a real deadline mattered, pay Groq $5 for dev tier. RPM goes to 1000+ and the whole pipeline finishes in minutes. I could not talk myself into this because "free tier" was part of the brief, but for real work the tradeoff is trivial.
 
 ---
 
-## 6. Progress-check query had a rate-calculation bug
+## 5. The classifier was silently falling back and I didn't notice for hours
 
-**What went wrong.** The check anchored its 10-minute window on `MAX(classified_at)`:
+The classifier catches `RateLimitError` on the primary model and quietly retries on the fallback. That's intentional. The problem was that the `log.warning` line that would have told me it happened kept getting eaten by the `| grep -v "HTTP Request"` filter I was using to keep the terminal readable, and buried underneath everything else in the log file.
+
+So during the "120b run," a chunk of the rows were actually being classified by 20b as silent fallbacks. I only caught it when I ran a `SELECT model_used, COUNT(*) GROUP BY model_used` and saw a suspicious ratio.
+
+I ended up adding a per-check breakdown of which models were used in the last window, so any drift is visible at a glance. That should have been in the check script from the start.
+
+Rule of thumb I'll take forward: if the code does something you'd want to know about, don't only log it as a warning. Surface it in the summary too. Warnings get filtered.
+
+---
+
+## 6. My progress check was measuring the wrong thing
+
+The check script was reporting "rate: 1500 reviews/min, ETA 2 minutes" while the classifier was actually stuck at 2 reviews/min. This went on for hours before I noticed. It's the bug I'm most embarrassed about, because the fix is one line.
+
+The buggy calc looked like this:
+
 ```python
 last = datetime.fromisoformat(rows[-1][0])
 cutoff = last - timedelta(minutes=10)
 recent = [r for r in rows if datetime.fromisoformat(r[0]) >= cutoff]
 rate = len(recent) / (last - first_in_recent).seconds
 ```
-Because the classifier writes 25 rows in one SQLite commit (BATCH_SIZE=25), those 25 rows share timestamps within ~1 second. The "10-minute window" caught 25 rows all landing in 1 second, computed `25 / 1s * 60s = 1500 reviews/min`, and reported "ETA: 2 minutes." Meanwhile the classifier was actually stuck at ~2 reviews/min real throughput. **Every check for hours reported healthy numbers while the run was stalled.**
 
-**How we recovered.** Rewrote the check (`scripts/check_progress.py`) to anchor the window on wall-clock now, and always divide by the fixed 10-minute window length rather than by the span between the first and last row inside it. Corrected the failure-delta calculation to use a persistent state file so we could measure "new failures since last check" across cron fires. Also lowered the alert thresholds to trigger on ≥1 failure/minute average and any sustained rate below 8/min.
+The classifier writes 25 rows per SQLite commit (BATCH_SIZE=25), and those 25 rows all get roughly the same timestamp. So "the last 10 minutes" was catching 25 rows all landing within one second, dividing by that one second, and reporting 1500/min. Meanwhile the real cadence was one batch every hour.
 
-**What we should have done from the start.**
-- **Anchor rate windows on wall-clock, always.** "Reviews per minute over the last 10 minutes" means `count_in_last_10_minutes / 10`, not `count_in_burst / burst_duration`. This mistake is one that shows up in dashboards and cron logs everywhere; the fix is trivial and matters a lot.
-- **Test the monitoring code as carefully as the pipeline code.** A five-review dry-run of the check script with a fake DB would have shown the burst-rate artefact immediately.
-- **Log deltas, not just totals.** For anything counted (failures, retries, tokens spent), record a checkpoint each time so "how much changed since the last check" is a single subtraction.
+The fix is to anchor the window on wall-clock now, and always divide by the fixed window length:
 
----
+```python
+cutoff = datetime.utcnow() - timedelta(minutes=10)
+count = rows_with_classified_at_after(cutoff)
+rate_per_min = count / 10   # always divide by 10 minutes, not by burst duration
+```
 
-## 7. Over-promised on "automatic" progress checks
+That's it. Once I made that change, the check started reporting the real rate, the alerts started firing correctly, and I could actually see the stalls that had been quietly happening.
 
-**What went wrong.** Set up a session-only cron job to fire the progress check every 10 minutes and treated it as "auto-checking every 10 minutes." What was missed: session-scoped scheduled tasks only fire when the driving process is actively idle. If the session is suspended or the terminal is closed between check windows, nothing fires. Combined with the bugged check query above, several stalls slipped past without a real check happening.
+Two takeaways:
 
-**How we recovered.** Killed the session-only cron and switched to running `check_progress.py` explicitly on demand. Set expectations for the automation to match what it can actually guarantee.
-
-**What we should have done from the start.**
-- **Understand the failure modes of the automation before promising it.** In-process schedulers in interactive tools are best-effort, not guaranteed. State that up front.
-- **For anything that must fire on a real schedule, use an OS-level scheduler** (Windows Task Scheduler, or a plain `while true; do python check_progress.py; sleep 600; done` in a second terminal). Both are more reliable than an in-process scheduled task tied to an interactive REPL.
+- Rate windows should always anchor on wall-clock time, not on data timestamps. "Reviews per minute over the last 10 minutes" means `count_in_window / 10`, full stop.
+- Test the monitoring code with the same care as the pipeline code. A five-review dry run with a mock DB would have shown the burst-rate artefact instantly.
 
 ---
 
-## 8. Silent HTTP 429 retries wasted TPD budget
+## 7. I over-promised what the "auto-check every 10 minutes" could do
 
-**What went wrong.** Every rate-limit hit triggered up to 4 tenacity retries with exponential backoff. Those retry calls each consumed a small amount of quota even when they failed. On a stalled bucket, we were re-hitting the same failing endpoint and burning a fraction of the daily budget on requests that would never succeed.
+I told the user I'd set up an automated check that would fire every 10 minutes and alert if the classifier stalled. What I actually set up was a session-scoped scheduled task, which only fires while the driving process is idle and alive. Between messages, if the session was suspended, nothing ran.
 
-**How we recovered.** Kept the retry policy (it does help on true transient failures) but rotated to a different model chain as soon as failures started to compound, which stopped the retry-storm on an exhausted bucket.
+Combined with the buggy check from lesson 6, several hours-long stalls slipped past without a single real check firing. From my side it looked like the automation was working; from reality's side the automation had barely run.
 
-**What we should have done from the start.**
-- **Distinguish transient errors from steady-state errors in the retry policy.** A 429 with `Retry-After: <big>` is not a "wait 2 seconds and try again" case — it's an "abandon this model" case. `tenacity` supports conditional retry predicates; a check on the retry-after header would have short-circuited retries against a truly exhausted bucket.
-- **Cap the daily 429 budget per model.** If a model returns >N 429s in a rolling window, mark it dead for the day and skip it entirely.
+I killed the session-scoped scheduler and just started running the check explicitly when I wanted a number. Boring but honest.
 
----
+If I had needed a truly automated monitor, the right tool would have been an OS-level scheduler (Windows Task Scheduler) or the world's simplest polling loop in a second terminal:
 
-## 9. No git repo, and the project lived in OneDrive
+```bash
+while true; do python check_progress.py; sleep 600; done
+```
 
-**What went wrong.** The project was created inside `C:\Users\<user>\OneDrive\Desktop\projects\pulse` and never `git init`'d during the build. Two consequences:
-- No local version history for code — every `config.py` edit during model rotations was ephemeral, and I couldn't roll back to a prior state cleanly.
-- OneDrive was continuously syncing every intermediate file, including the SQLite database, the raw reviews CSV, and (briefly) the misplaced API key file.
-
-**How we recovered.** Nothing broke because of either issue, but both added risk that was avoidable.
-
-**What we should have done from the start.**
-- **`git init` and an initial `git add .` commit on day one.** Every rotation of `PRIMARY_MODEL` would then be a real commit — useful for the interview-story timeline and for rolling back a misconfiguration.
-- **Keep dev projects out of cloud-sync roots.** `C:\dev\pulse\` avoids OneDrive syncing every intermediate file. If the project must live in the sync root, exclude the folder from OneDrive via the client's "Choose folders" or "Exclude" settings — the sync client re-scans on save otherwise.
+Both would have kept running whether the assistant session was awake or not. The lesson: know what "automatic" means for the specific tool you're using before you promise it to anyone.
 
 ---
 
-## 10. Windows console encoding tripped over emoji in reviews
+## 8. Retrying against an exhausted bucket wasted quota
 
-**What went wrong.** Play Store reviews are full of emoji, Devanagari, Kannada, Arabic, and other non-Latin scripts. Windows' default console codec is `cp1252`, which cannot encode most of those characters. Every attempt to print a sample review to the terminal raised `UnicodeEncodeError`, even though the CSV file itself was written in UTF-8 correctly.
+Every rate-limit response triggered up to 4 tenacity retries with exponential backoff. That's fine for a transient blip, but a rate-limited *bucket* is not transient — it's a steady state that lasts until the daily quota window rolls over. Retrying against it just burns fractional quota on requests that will never succeed, and each retry counts toward TPM even when it returns nothing useful.
 
-**How we recovered.** Ran Python with `-X utf8` on every invocation, which forces the interpreter into UTF-8 mode for stdin/stdout regardless of the console codec.
+I kept the retry policy (it does help on true transients) but leaned on rotation to escape a truly stuck bucket rather than sitting on it.
 
-**What we should have done from the start.**
-- **Set `PYTHONUTF8=1` in the environment (or in a `.env` file the pipeline reads).** Same effect as `-X utf8` without needing to remember the flag each time.
-- **Never assume the terminal codec matches the file codec on Windows.** Files can be UTF-8 while the terminal is cp1252; that's the default state on Windows 10/11.
+For a rebuild I'd tighten the retry logic:
 
----
-
-## 11. Failure log had no timestamps
-
-**What went wrong.** The classifier wrote failures as `{"review_id":..., "text":..., "reason":...}` — no `logged_at` field. When 200+ failures appeared in a check window, we couldn't tell whether they happened over the last 5 minutes (fast collapse — rotate immediately) or over the last 5 hours (slow bleed — hold and see). The `check_progress.py` state file worked around this by tracking the failure-count delta between checks, but that only tells us "how many since last check", not "when they happened".
-
-**How we recovered.** Persisted the failure count in `logs/check_state.json` between check runs so we could report a delta.
-
-**What we should have done from the start.**
-- **Every log line gets a timestamp.** Same for every DB row. Non-negotiable.
-- **JSONL log entries are ~free to enrich.** `{"logged_at": <iso8601>, "review_id": ..., "reason": ...}` gives us everything we need to compute failure velocity without a sidecar state file.
+- Distinguish "429 with a small `Retry-After`" (worth waiting on) from "429 with a large `Retry-After`" (bucket is dead, abandon it).
+- Cap the daily 429 budget per model — if a model returns more than N 429s in a rolling window, mark it dead-for-the-day and skip it. `tenacity` supports conditional retry predicates, so this is a small change.
 
 ---
 
-## Meta-lessons
+## 9. No git repo, and the project lived under OneDrive
 
-Three that come up across most of the individual incidents:
+Two things I should have set up on day one but didn't:
 
-1. **Probe before committing.** The Blinkit review-rate mismatch, the deprecated Llama models, the free-tier RPM assumption — every one of these would have been caught by a 30-second probe before the pipeline was built to depend on it. "Cheap probes upfront" beats "expensive rewrites later" almost every time.
-2. **Measure the thing you're claiming.** Every ETA I quoted was wrong until the progress check was rewritten to measure what it actually claimed to measure. Same principle applies to review counts, model choice, revenue-at-risk numbers — always sanity-check that the reported figure is the figure you meant to compute.
-3. **Design for provenance from day one.** The `model_used` column, the `raw_reviews_full.csv` checkpoint, and the SQLite idempotency were all things we happened to build in for other reasons — but they saved the run when we had to rotate models mid-flight. If a downstream consumer might ever ask "which model / which pull / which run produced this row", the answer should be embedded in the data, not reconstructed from git history.
+- **`git init`**. During the model rotations I was editing `config.py` a lot, and every edit was ephemeral — no history, no easy rollback. It also meant I had no clean way to answer "is this leaked key in a commit?" (see lesson 3). Fifteen seconds of work up front.
+- **A project location outside OneDrive**. Sync is aggressive and constant. Every intermediate CSV, every SQLite write, every `.env` change was going to Microsoft's cloud. Nothing bad came of it, but it's the kind of thing that's zero cost to prevent and non-trivial to unwind after the fact.
+
+Neither of these broke anything, but both added risk that was avoidable.
+
+---
+
+## 10. Windows terminal codec choked on emoji
+
+Play Store reviews are full of emoji, Devanagari, Kannada, Arabic, and a lot of other non-ASCII. Windows' default console codec is `cp1252`, which can't encode any of that. So every time I tried to print a review to the terminal, I got a `UnicodeEncodeError`, even though the CSV file itself was written in UTF-8 correctly.
+
+The workaround is `python -X utf8 my_script.py`, which forces UTF-8 mode for stdin/stdout regardless of what the console thinks. I typed that a lot.
+
+The permanent fix is `PYTHONUTF8=1` as an environment variable (or in the `.env` file that everything else already reads). Same effect, without having to remember the flag each time.
+
+Reminder to myself: on Windows, file codec and terminal codec are two separate settings. Files being UTF-8 tells you nothing about whether the terminal can display them.
+
+---
+
+## 11. My failure log had no timestamps
+
+The classifier logged failures as `{"review_id": ..., "text": ..., "reason": ...}` — no `logged_at` field. When 200+ failures showed up in a check window, I couldn't tell whether they'd happened in the last five minutes (a fast collapse — rotate immediately) or over the last five hours (a slow bleed — hold and see). That's exactly the information the log is supposed to give me.
+
+I worked around it by persisting the failure count between check runs in a state file, so at least I could report a delta. But that only tells me "how many since the last check," not "when specifically they happened."
+
+Not-negotiable rule for next time: every log line gets a timestamp. Same for every DB row. JSONL entries are effectively free to enrich — one extra key, no performance cost, and it prevents this exact class of confusion.
+
+---
+
+## Three patterns that showed up more than once
+
+Skimming back through this list, the same handful of mistakes keep showing up:
+
+**I trusted the brief without probing.** The Blinkit review rate, the deprecated Llama models, the free-tier RPM number — every one of them would have been caught by a 30-second live check before I committed to the plan. Cheap probes upfront beat expensive rewrites later.
+
+**I claimed things I wasn't measuring.** The 60-minute ETA, the 1500/min rate, the "auto-checks every 10 minutes" — none of those were true, and I couldn't have known they were false without stopping to ask "am I actually measuring what I think I'm measuring?" I want that question to be reflexive next time.
+
+**Provenance columns saved the run.** The `model_used` column, the split between `raw_reviews_full.csv` and `raw_reviews.csv`, the SQLite idempotency — I built all of them for their obvious first-order reasons, but they turned out to matter because they let me rotate models mid-run without losing my place or fudging the audit trail. If a downstream reader might ever ask "which pull / which model / which run produced this row," bake the answer into the data. Cheap now, invaluable later.
