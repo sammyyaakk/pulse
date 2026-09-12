@@ -1,4 +1,19 @@
+import sys
 from pathlib import Path
+
+# Play Store reviews carry emoji and non-Latin scripts (Hindi, Kannada, Arabic).
+# Windows' default console codec is cp1252, which can't encode any of that, so
+# any print() of review text raises UnicodeEncodeError. Reconfigure stdout and
+# stderr to UTF-8 at import time so every script that reads from config gets
+# safe printing without needing to be invoked with `python -X utf8`.
+# No-op on POSIX (where stdout is already UTF-8) and when stdout is a piped or
+# captured stream without a .reconfigure method.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
