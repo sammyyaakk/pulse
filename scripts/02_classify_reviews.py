@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ from typing import Iterable
 
 import pandas as pd
 from dotenv import load_dotenv
-from groq import Groq, RateLimitError
+from groq import AsyncGroq, RateLimitError
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -25,6 +26,7 @@ from config import (
     BATCH_SIZE,
     CLASSIFIED_DB,
     CLASSIFY_BATCH_SIZE,
+    CLASSIFY_CONCURRENCY,
     CLASSIFY_FAILURES_LOG,
     DATA_DIR,
     FALLBACK_MODEL,
@@ -133,8 +135,8 @@ def log_failure(review_id: str, text: str, reason: str) -> None:
     wait=wait_exponential(multiplier=1, min=2, max=30),
     retry=retry_if_exception_type(Exception),
 )
-def _call_groq(client: Groq, model: str, review_text: str) -> dict:
-    resp = client.chat.completions.create(
+async def _call_groq(client: AsyncGroq, model: str, review_text: str) -> dict:
+    resp = await client.chat.completions.create(
         model=model,
         temperature=0,
         response_format={"type": "json_object"},
@@ -153,8 +155,8 @@ def _call_groq(client: Groq, model: str, review_text: str) -> dict:
     wait=wait_exponential(multiplier=1, min=2, max=30),
     retry=retry_if_exception_type(Exception),
 )
-def _call_groq_batch(client: Groq, model: str, payload: list[dict]) -> dict:
-    resp = client.chat.completions.create(
+async def _call_groq_batch(client: AsyncGroq, model: str, payload: list[dict]) -> dict:
+    resp = await client.chat.completions.create(
         model=model,
         temperature=0,
         response_format={"type": "json_object"},
@@ -181,10 +183,10 @@ def _parse_one_result(item: dict, review_id: str, text: str, model: str) -> Clas
     return Classification(review_id, category, severity, justification, model)
 
 
-def classify_one(client: Groq, review_id: str, text: str) -> Classification | None:
+async def classify_one(client: AsyncGroq, review_id: str, text: str) -> Classification | None:
     for model in (PRIMARY_MODEL, FALLBACK_MODEL):
         try:
-            data = _call_groq(client, model, text)
+            data = await _call_groq(client, model, text)
         except RateLimitError as exc:
             log.warning("rate limit on %s (%s); trying fallback", model, exc)
             continue
@@ -200,7 +202,8 @@ def classify_one(client: Groq, review_id: str, text: str) -> Classification | No
     return None
 
 
-def classify_batch(client: Groq, reviews_batch: list[tuple[str, str]]) -> list[Classification]:
+async def classify_batch(client: AsyncGroq,
+                         reviews_batch: list[tuple[str, str]]) -> list[Classification]:
     """Classify a batch of reviews in a single API call.
 
     Falls back to per-review classify_one() calls if the batch response is
@@ -214,20 +217,20 @@ def classify_batch(client: Groq, reviews_batch: list[tuple[str, str]]) -> list[C
 
     for model in (PRIMARY_MODEL, FALLBACK_MODEL):
         try:
-            data = _call_groq_batch(client, model, payload)
+            data = await _call_groq_batch(client, model, payload)
         except RateLimitError as exc:
             log.warning("batch rate limit on %s (%s); trying fallback", model, exc)
             continue
         except Exception as exc:
             log.warning("batch call raised %s on %s; falling back to per-review",
                         type(exc).__name__, model)
-            return _classify_batch_sequentially(client, reviews_batch)
+            return await _classify_batch_sequentially(client, reviews_batch)
 
         results = data.get("results")
         if not isinstance(results, list) or len(results) < len(reviews_batch):
             log.warning("batch under-returned (%d of %d) on %s; falling back to per-review",
                         len(results) if isinstance(results, list) else 0, len(reviews_batch), model)
-            return _classify_batch_sequentially(client, reviews_batch)
+            return await _classify_batch_sequentially(client, reviews_batch)
 
         by_id = {}
         for item in results:
@@ -256,7 +259,7 @@ def classify_batch(client: Groq, reviews_batch: list[tuple[str, str]]) -> list[C
                         missing)
             missing_reviews = [(rid, text) for idx, (rid, text) in enumerate(reviews_batch)
                                if idx not in by_id]
-            out.extend(_classify_batch_sequentially(client, missing_reviews))
+            out.extend(await _classify_batch_sequentially(client, missing_reviews))
 
         return out
 
@@ -265,14 +268,55 @@ def classify_batch(client: Groq, reviews_batch: list[tuple[str, str]]) -> list[C
     return []
 
 
-def _classify_batch_sequentially(client: Groq,
-                                 reviews_batch: list[tuple[str, str]]) -> list[Classification]:
+async def _classify_batch_sequentially(client: AsyncGroq,
+                                       reviews_batch: list[tuple[str, str]]
+                                       ) -> list[Classification]:
     out: list[Classification] = []
     for rid, text in reviews_batch:
-        result = classify_one(client, rid, text)
+        result = await classify_one(client, rid, text)
         if result is not None:
             out.append(result)
     return out
+
+
+def _chunks(rows: list[tuple[str, str]], n: int) -> list[list[tuple[str, str]]]:
+    return [rows[i:i + n] for i in range(0, len(rows), n)]
+
+
+async def run_async(client: AsyncGroq,
+                    remaining_rows: list[tuple[str, str]],
+                    conn: sqlite3.Connection) -> None:
+    batches = _chunks(remaining_rows, CLASSIFY_BATCH_SIZE)
+    total = len(remaining_rows)
+    log.info("running with concurrency=%d over %d batches (%d reviews, batch=%d)",
+             CLASSIFY_CONCURRENCY, len(batches), total, CLASSIFY_BATCH_SIZE)
+
+    sem = asyncio.Semaphore(CLASSIFY_CONCURRENCY)
+
+    async def bounded(batch: list[tuple[str, str]]) -> list[Classification]:
+        async with sem:
+            return await classify_batch(client, batch)
+
+    tasks = [asyncio.create_task(bounded(b)) for b in batches]
+
+    write_buffer: list[Classification] = []
+    completed_batches = 0
+
+    for done_task in asyncio.as_completed(tasks):
+        results = await done_task
+        write_buffer.extend(results)
+        completed_batches += 1
+        processed = min(completed_batches * CLASSIFY_BATCH_SIZE, total)
+
+        if len(write_buffer) >= BATCH_SIZE:
+            save_batch(conn, write_buffer)
+            log.info("wrote checkpoint - %d processed / %d remaining, %d failures",
+                     processed, max(total - processed, 0), _count_failures())
+            write_buffer.clear()
+
+    if write_buffer:
+        save_batch(conn, write_buffer)
+        log.info("wrote final checkpoint - %d processed total", total)
 
 
 def main() -> None:
@@ -303,33 +347,17 @@ def main() -> None:
         remaining = remaining.head(args.limit)
         log.info("--limit %d: classifying only the first %d", args.limit, len(remaining))
 
-    client = Groq(api_key=api_key)
+    remaining_rows = [(str(r.review_id), str(r.text))
+                      for r in remaining.itertuples(index=False)]
 
-    pending: list[tuple[str, str]] = []
-    write_buffer: list[Classification] = []
-    processed = 0
-    for row in remaining.itertuples(index=False):
-        pending.append((str(row.review_id), str(row.text)))
-        processed += 1
+    async def _entry() -> None:
+        client = AsyncGroq(api_key=api_key)
+        try:
+            await run_async(client, remaining_rows, conn)
+        finally:
+            await client.close()
 
-        if len(pending) >= CLASSIFY_BATCH_SIZE:
-            write_buffer.extend(classify_batch(client, pending))
-            pending.clear()
-
-        if len(write_buffer) >= BATCH_SIZE:
-            save_batch(conn, write_buffer)
-            log.info("wrote batch - %d processed / %d remaining, %d in this run's failures.jsonl",
-                     processed, len(remaining) - processed, _count_failures())
-            write_buffer.clear()
-
-    if pending:
-        write_buffer.extend(classify_batch(client, pending))
-        pending.clear()
-
-    if write_buffer:
-        save_batch(conn, write_buffer)
-        log.info("wrote final batch - %d processed total", processed)
-
+    asyncio.run(_entry())
     conn.close()
 
 
