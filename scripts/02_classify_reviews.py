@@ -48,6 +48,7 @@ class _ChainState:
 
     def __init__(self) -> None:
         self.index = 0
+        self.advances = 0
 
     def current(self) -> tuple[str, str] | None:
         if self.index >= len(MODEL_CHAIN):
@@ -57,6 +58,7 @@ class _ChainState:
     def advance_from(self, from_index: int) -> None:
         if self.index == from_index and self.index < len(MODEL_CHAIN):
             self.index += 1
+            self.advances += 1
             new = self.current()
             if new is not None:
                 log.warning("chain: advancing to pair %d = %s / %s",
@@ -65,7 +67,20 @@ class _ChainState:
                 log.warning("chain: exhausted after %d pairs", self.index)
 
 
+@dataclass
+class _RunStats:
+    """Counters populated during a classifier run.
+
+    Reset at the top of run_async() so a resume run reports only its own
+    numbers rather than accumulating across restarts.
+    """
+    started_at: datetime | None = None
+    batch_to_seq_falls: int = 0
+    written: int = 0
+
+
 chain_state = _ChainState()
+run_stats = _RunStats()
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -357,6 +372,7 @@ async def classify_batch(client: AsyncGroq,
         if results:
             return results
         if malformed:
+            run_stats.batch_to_seq_falls += 1
             return await _classify_batch_sequentially(client, reviews_batch)
         if rate_limited_both:
             chain_state.advance_from(idx)
@@ -386,6 +402,13 @@ def _chunks(rows: list[tuple[str, str]], n: int) -> list[list[tuple[str, str]]]:
 async def run_async(client: AsyncGroq,
                     remaining_rows: list[tuple[str, str]],
                     conn: sqlite3.Connection) -> None:
+    run_stats.started_at = datetime.now(timezone.utc)
+    run_stats.batch_to_seq_falls = 0
+    run_stats.written = 0
+    chain_state.advances = 0
+    starting_index = chain_state.index
+    starting_failures = _count_failures()
+
     batches = _chunks(remaining_rows, CLASSIFY_BATCH_SIZE)
     total = len(remaining_rows)
     log.info("running with concurrency=%d over %d batches (%d reviews, batch=%d)",
@@ -410,13 +433,60 @@ async def run_async(client: AsyncGroq,
 
         if len(write_buffer) >= BATCH_SIZE:
             save_batch(conn, write_buffer)
+            run_stats.written += len(write_buffer)
             log.info("wrote checkpoint - %d processed / %d remaining, %d failures",
                      processed, max(total - processed, 0), _count_failures())
             write_buffer.clear()
 
     if write_buffer:
         save_batch(conn, write_buffer)
+        run_stats.written += len(write_buffer)
         log.info("wrote final checkpoint - %d processed total", total)
+
+    _log_run_summary(conn, total, starting_index, starting_failures)
+
+
+def _log_run_summary(conn: sqlite3.Connection,
+                     total_requested: int,
+                     starting_chain_index: int,
+                     starting_failures: int) -> None:
+    """One-line summary of what this run actually did.
+
+    Reports metrics scoped to THIS run, not lifetime totals: rows written
+    by this process, failures logged since start, chain advances taken,
+    and per-model breakdown of rows classified since started_at.
+    """
+    ended_at = datetime.now(timezone.utc)
+    elapsed_s = (ended_at - run_stats.started_at).total_seconds() \
+        if run_stats.started_at else 0
+
+    failures_this_run = _count_failures() - starting_failures
+    started_iso = (run_stats.started_at
+                   .replace(tzinfo=None)
+                   .isoformat(sep=" ", timespec="seconds")) \
+        if run_stats.started_at else None
+
+    model_breakdown: dict[str, int] = {}
+    if started_iso is not None:
+        rows = conn.execute(
+            "SELECT model_used, COUNT(*) FROM classifications "
+            "WHERE classified_at >= ? GROUP BY model_used",
+            (started_iso,),
+        ).fetchall()
+        model_breakdown = {m: c for m, c in rows}
+
+    rate_per_min = (run_stats.written / elapsed_s * 60) if elapsed_s > 0 else 0
+
+    log.info(
+        "RUN SUMMARY: written=%d/%d failures=%d elapsed=%.0fs (%.1f/min) "
+        "chain_advances=%d (index %d->%d) batch_to_seq_falls=%d",
+        run_stats.written, total_requested, failures_this_run, elapsed_s,
+        rate_per_min, chain_state.advances,
+        starting_chain_index, chain_state.index, run_stats.batch_to_seq_falls,
+    )
+    if model_breakdown:
+        breakdown_str = ", ".join(f"{m}={c}" for m, c in sorted(model_breakdown.items()))
+        log.info("RUN MODEL BREAKDOWN: %s", breakdown_str)
 
 
 def main() -> None:
