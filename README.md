@@ -25,6 +25,14 @@ Each stage reads the previous stage's checkpoint, so a crash or a rate-limit hic
 
 Phase 1 does two things in sequence: scrape as many reviews as Play Store will serve (up to `SCRAPE_TARGET`), then uniform-random downsample to `CLASSIFY_TARGET` rows for classification. Uniform-random matters because it preserves the true per-day density, so the trend charts reflect real review volume instead of a flat sampling artefact.
 
+Phase 2 is the interesting one operationally. It:
+
+- Sends `CLASSIFY_BATCH_SIZE` reviews per Groq API call (default 5), so RPM usage on the free tier is one-fifth of what a naïve per-review loop would use.
+- Runs `CLASSIFY_CONCURRENCY` batches in flight at once via `asyncio` and `AsyncGroq`, so wall-clock throughput sits near the RPM ceiling instead of well below it.
+- Walks a `MODEL_CHAIN` of `(primary, fallback)` pairs. When both models in the current pair start returning 429s in tandem — which happens on Groq's free tier once a per-model daily TPD cap kicks in — the classifier advances to the next pair on its own and keeps going. No manual restart needed.
+- Writes to SQLite every 25 successful classifications, and skips any `review_id` already in the table on restart, so a crash or a `Ctrl+C` costs at most one checkpoint of work.
+- Ends every run with a two-line `RUN SUMMARY` in the log naming rows written, failures, elapsed time, chain advances, and the per-model breakdown for that run.
+
 ## Setup
 
 ```bash
@@ -57,6 +65,16 @@ python scripts/04_revenue_at_risk.py
 ```
 
 Phase 2 is idempotent. It skips any `review_id` already in the SQLite table, so if it dies mid-run, just restart it.
+
+## Tests
+
+Small pytest suite for the aggregation and revenue-at-risk layers, which are the two places where a silent arithmetic regression would produce wrong dashboard numbers without any visible error.
+
+```bash
+python -m pytest tests/
+```
+
+24 tests, runs in under a second. Uses tmp fixtures for the CSV + SQLite paths, so no test touches production data.
 
 ## Taxonomy
 
@@ -117,7 +135,18 @@ The build did not go to plan. Deprecated models, tighter free-tier rate limits t
 
 ## Model provenance (Phase 2)
 
-Groq's free-tier rate limits are per-model, and no single model was going to carry the full 5k on its own. So the classifier rotated across model families as buckets throttled, and the `model_used` column records which model produced each row. The final split:
+Groq's free-tier rate limits are per-model, so no single model can carry a 5k run without hitting a daily cap. The classifier's `MODEL_CHAIN` is a list of `(primary, fallback)` pairs; when both models in the current pair start 429-ing together, `_ChainState` advances to the next pair on its own. Every row records which model actually produced it in the `model_used` column.
+
+Ordered so the fastest fresh combo is tried first:
+
+| Rank | Primary | Fallback |
+|---|---|---|
+| 1 | openai/gpt-oss-20b | qwen/qwen3.8-27b |
+| 2 | openai/gpt-oss-safeguard-20b | openai/gpt-oss-20b |
+| 3 | openai/gpt-oss-120b | groq/compound-mini |
+| 4 | qwen/qwen3.8-27b | qwen/qwen3.6-27b |
+
+The initial 5k run in this repo cycled through most of these pairs as buckets throttled. The final per-model split (from `data/classified_reviews.db`):
 
 | Model | Rows | Share |
 |---|---|---|
@@ -128,22 +157,26 @@ Groq's free-tier rate limits are per-model, and no single model was going to car
 | qwen/qwen3.6-27b | 95 | 1.9% |
 | groq/compound-mini | 1 | ~0% |
 
-The label schema (`category`, `severity`, `justification`) is identical across all six. Any row whose category wasn't in the taxonomy was rejected and re-classified rather than silently accepted, so the mixed provenance doesn't leak into the analysis. Full write-up of how the rotation actually played out is in the lessons-learned doc.
+The label schema (`category`, `severity`, `justification`) is identical across every model. Any row whose category wasn't in the taxonomy is rejected and re-classified rather than silently accepted, so the mixed provenance doesn't leak into the analysis. The full write-up of how the rotation played out and what I'd design differently is in the lessons doc.
 
 ## Repo layout
 
 ```
 pulse/
   scripts/
-    config.py                    # taxonomy, paths, model IDs
+    config.py                    # taxonomy, paths, model chain, batch/concurrency knobs
     01_scrape_reviews.py
-    02_classify_reviews.py
+    02_classify_reviews.py       # async + batched + chain-rotating classifier
     03_aggregate.py
     04_revenue_at_risk.py
-    check_progress.py            # standalone monitor for the Phase 2 run
+    check_progress.py            # standalone monitor for a live Phase 2 run
+  tests/
+    conftest.py                  # loads the numbered scripts as importable modules
+    test_aggregate.py            # 13 tests for the aggregation layer
+    test_revenue_at_risk.py      # 11 tests for the revenue-at-risk arithmetic
   data/                          # CSV / SQLite checkpoints (gitignored)
   exports/                       # dashboard tables + memo
-  logs/                          # scrape log, classification failures
+  logs/                          # scrape log, classification failures with timestamps
   requirements.txt
   .env.example
 ```
