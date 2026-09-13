@@ -133,6 +133,14 @@ The build did not go to plan. Deprecated models, tighter free-tier rate limits t
 - **Top theme by revenue-at-risk:** Customer service / refunds. 402 one-star reviews, average severity 4.37 / 5, ≈ ₹23.2 lakh at risk.
 - **Full ranking:** [`data/revenue_at_risk.csv`](data/revenue_at_risk.csv).
 
+## Dashboard
+
+Built in Power BI Desktop from the four flat tables in [`exports/pulse_dashboard_tables.xlsx`](exports/pulse_dashboard_tables.xlsx) plus the ranking in [`data/revenue_at_risk.csv`](data/revenue_at_risk.csv). Single page, five views: KPI row on top; theme ranking (revenue at risk), monthly complaint trend, rating distribution matrix, and a volume-vs-severity bubble plot underneath.
+
+![Pulse dashboard](dashboard/pulse-preview.png)
+
+The `.pbix` file lives at [`dashboard/pulse.pbix`](dashboard/pulse.pbix) — download it and open in Power BI Desktop (free) to poke at the model and the visuals directly.
+
 ## Model provenance (Phase 2)
 
 Groq's free-tier rate limits are per-model, so no single model can carry a 5k run without hitting a daily cap. The classifier's `MODEL_CHAIN` is a list of `(primary, fallback)` pairs; when both models in the current pair start 429-ing together, `_ChainState` advances to the next pair on its own. Every row records which model actually produced it in the `model_used` column.
